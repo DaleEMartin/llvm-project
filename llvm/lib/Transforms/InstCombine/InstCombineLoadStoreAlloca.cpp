@@ -31,6 +31,217 @@ using namespace PatternMatch;
 STATISTIC(NumDeadStore,    "Number of dead stores eliminated");
 STATISTIC(NumGlobalCopies, "Number of allocas copied from constant global");
 
+  // while (!ValuesToInspect.empty()) {
+  //   auto ValuePair = ValuesToInspect.pop_back_val();
+  //   const bool IsOffset = ValuePair.second;
+  //   for (auto &U : ValuePair.first->uses()) {
+  //     auto *I = cast<Instruction>(U.getUser());
+
+  //     if (auto *LI = dyn_cast<LoadInst>(I)) {
+  //       // Ignore non-volatile loads, they are always ok.
+  //       if (!LI->isSimple()) return false;
+  //       continue;
+  //     }
+
+  //     if (isa<BitCastInst>(I) || isa<AddrSpaceCastInst>(I)) {
+  //       // If uses of the bitcast are ok, we are ok.
+  //       ValuesToInspect.emplace_back(I, IsOffset);
+  //       continue;
+  //     }
+  //     if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
+  //       // If the GEP has all zero indices, it doesn't offset the pointer. If it
+  //       // doesn't, it does.
+  //       ValuesToInspect.emplace_back(I, IsOffset || !GEP->hasAllZeroIndices());
+  //       continue;
+  //     }
+
+  //     if (auto *Call = dyn_cast<CallBase>(I)) {
+  //       // If this is the function being called then we treat it like a load and
+  //       // ignore it.
+  //       if (Call->isCallee(&U))
+  //         continue;
+
+  //       unsigned DataOpNo = Call->getDataOperandNo(&U);
+  //       bool IsArgOperand = Call->isArgOperand(&U);
+
+  //       // Inalloca arguments are clobbered by the call.
+  //       if (IsArgOperand && Call->isInAllocaArgument(DataOpNo))
+  //         return false;
+
+  //       // If this is a readonly/readnone call site, then we know it is just a
+  //       // load (but one that potentially returns the value itself), so we can
+  //       // ignore it if we know that the value isn't captured.
+  //       if (Call->onlyReadsMemory() &&
+  //           (Call->use_empty() || Call->doesNotCapture(DataOpNo)))
+  //         continue;
+
+  //       // If this is being passed as a byval argument, the caller is making a
+  //       // copy, so it is only a read of the alloca.
+  //       if (IsArgOperand && Call->isByValArgument(DataOpNo))
+  //         continue;
+  //     }
+
+  //     // Lifetime intrinsics can be handled by the caller.
+  //     if (I->isLifetimeStartOrEnd()) {
+  //       assert(I->use_empty() && "Lifetime markers have no result to use!");
+  //       ToDelete.push_back(I);
+  //       continue;
+  //     }
+
+  //     // If this is isn't our memcpy/memmove, reject it as something we can't
+  //     // handle.
+  //     MemTransferInst *MI = dyn_cast<MemTransferInst>(I);
+  //     if (!MI)
+  //       return false;
+
+  //     // If the transfer is using the alloca as a source of the transfer, then
+  //     // ignore it since it is a load (unless the transfer is volatile).
+  //     if (U.getOperandNo() == 1) {
+  //       if (MI->isVolatile()) return false;
+  //       continue;
+  //     }
+
+  //     // If we already have seen a copy, reject the second one.
+  //     if (TheCopy) return false;
+
+  //     // If the pointer has been offset from the start of the alloca, we can't
+  //     // safely handle this.
+  //     if (IsOffset) return false;
+
+  //     // If the memintrinsic isn't using the alloca as the dest, reject it.
+  //     if (U.getOperandNo() != 0) return false;
+
+  //     // If the source of the memcpy/move is not a constant global, reject it.
+  //     if (!AA->pointsToConstantMemory(MI->getSource()))
+  //       return false;
+
+  //     // Otherwise, the transform is safe.  Remember the copy instruction.
+  //     TheCopy = MI;
+  //   }
+
+
+using ToInspectType = SmallVector<std::pair<Value *, bool>, 35>;
+using ToDeleteVector = SmallVectorImpl<Instruction *>;
+
+enum class NextAction { NextInstruction, ReturnFalse };
+
+struct CopiedFromConstDispatcher final : public InstVisitor<CopiedFromConstDispatcher, NextAction> {
+  CopiedFromConstDispatcher(AAResults &AA,
+			    Use &U,
+			    MemTransferInst *&TheCopy,
+			    ToDeleteVector &ToDelete,
+			    ToInspectType &ValuesToInspect,
+			    bool IsOffset)
+    : AA(AA)
+    , U(U)
+    , TheCopy(TheCopy)
+    , ToDelete(ToDelete)
+    , ValuesToInspect(ValuesToInspect)
+    , IsOffset(IsOffset){}
+
+    NextAction visitLoadInst(LoadInst &LI) {
+      if (!LI.isSimple()) {
+	return NextAction::ReturnFalse;
+      }
+      return NextAction::NextInstruction;
+    }
+
+    NextAction visitBitCastInst(BitCastInst &I) {
+      ValuesToInspect.emplace_back(&I, IsOffset);
+      return NextAction::NextInstruction;
+    }
+    NextAction visitAddrSpaceCastInst(AddrSpaceCastInst &I) {
+      ValuesToInspect.emplace_back(&I, IsOffset);
+      return NextAction::NextInstruction;
+    }
+    NextAction visitGetElementPtrInst(GetElementPtrInst &GEP) {
+      // This looks weird
+      ValuesToInspect.emplace_back(&GEP, IsOffset || !GEP.hasAllZeroIndices());
+      return NextAction::NextInstruction;
+    }
+    NextAction visitCallBase(CallBase &Call) {
+      // If this is the function being called then we treat it like a load and
+      // ignore it.
+      if (Call.isCallee(&U)) {
+	return NextAction::NextInstruction;
+      }
+
+      unsigned DataOpNo = Call.getDataOperandNo(&U);
+      bool IsArgOperand = Call.isArgOperand(&U);
+
+      // Inalloca arguments are clobbered by the call.
+      if (IsArgOperand && Call.isInAllocaArgument(DataOpNo)) {
+	return NextAction::ReturnFalse;
+      }
+
+      // If this is a readonly/readnone call site, then we know it is just a
+      // load (but one that potentially returns the value itself), so we can
+      // ignore it if we know that the value isn't captured.
+      if (Call.onlyReadsMemory() &&
+	  (Call.use_empty() || Call.doesNotCapture(DataOpNo))) {
+	return NextAction::NextInstruction;
+      }
+
+      // If this is being passed as a byval argument, the caller is making a
+      // copy, so it is only a read of the alloca.
+      if (IsArgOperand && Call.isByValArgument(DataOpNo)) {
+	return NextAction::NextInstruction;
+      }
+
+      if (Call.isLifetimeStartOrEnd()) {
+	assert(Call.use_empty() && "Lifetime markers have no result to use!");
+	ToDelete.push_back(&Call);
+	return NextAction::NextInstruction;
+      }
+ 
+     return NextAction::ReturnFalse;
+    }
+
+  NextAction visitMemTransferInst(MemTransferInst &MI) {
+    // If the transfer is using the alloca as a source of the transfer, then
+    // ignore it since it is a load (unless the transfer is volatile).
+    if (U.getOperandNo() == 1) {
+      if (MI.isVolatile()) {
+	return NextAction::ReturnFalse;
+      }
+      return NextAction::NextInstruction;
+    }
+
+    // If the memintrinsic isn't using the alloca as the dest, reject it.
+    if (U.getOperandNo() != 0) {
+      return NextAction::ReturnFalse;
+    }
+
+    // If the source of the memcpy/move is not a constant global, reject it.
+    if (!AA.pointsToConstantMemory(MI.getSource())) {
+      return NextAction::ReturnFalse;
+    }
+
+    if (TheCopy) {
+      return NextAction::ReturnFalse;
+    }
+
+    if (IsOffset) {
+      return NextAction::ReturnFalse;
+    }
+    // Otherwise, the transform is safe.  Remember the copy instruction.
+    TheCopy = &MI;
+    return NextAction::NextInstruction;
+  }
+  NextAction visitInstruction(Instruction &I)    {
+    return NextAction::NextInstruction;
+  }
+
+private:
+  AAResults &AA;
+  Use &U;
+  MemTransferInst *&TheCopy;
+  ToDeleteVector &ToDelete;
+  ToInspectType &ValuesToInspect;
+  bool IsOffset{};
+};
+
+
 /// isOnlyCopiedFromConstantGlobal - Recursively walk the uses of a (derived)
 /// pointer to an alloca.  Ignore any reads of the pointer, return false if we
 /// see any stores or other unknown uses.  If we see pointer arithmetic, keep
@@ -46,94 +257,18 @@ isOnlyCopiedFromConstantMemory(AAResults *AA,
   // ahead and replace the value with the global, this lets the caller quickly
   // eliminate the markers.
 
-  SmallVector<std::pair<Value *, bool>, 35> ValuesToInspect;
+  ToInspectType ValuesToInspect;
   ValuesToInspect.emplace_back(V, false);
   while (!ValuesToInspect.empty()) {
     auto ValuePair = ValuesToInspect.pop_back_val();
     const bool IsOffset = ValuePair.second;
-    for (auto &U : ValuePair.first->uses()) {
-      auto *I = cast<Instruction>(U.getUser());
+    for (auto &currentUse : ValuePair.first->uses()) {
+      auto *currentUserInst = cast<Instruction>(currentUse.getUser());
 
-      if (auto *LI = dyn_cast<LoadInst>(I)) {
-        // Ignore non-volatile loads, they are always ok.
-        if (!LI->isSimple()) return false;
-        continue;
+      CopiedFromConstDispatcher dispatcher(*AA, currentUse, TheCopy, ToDelete, ValuesToInspect, IsOffset);
+      if (dispatcher.visit(currentUserInst) == NextAction::ReturnFalse) {
+	return false;
       }
-
-      if (isa<BitCastInst>(I) || isa<AddrSpaceCastInst>(I)) {
-        // If uses of the bitcast are ok, we are ok.
-        ValuesToInspect.emplace_back(I, IsOffset);
-        continue;
-      }
-      if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
-        // If the GEP has all zero indices, it doesn't offset the pointer. If it
-        // doesn't, it does.
-        ValuesToInspect.emplace_back(I, IsOffset || !GEP->hasAllZeroIndices());
-        continue;
-      }
-
-      if (auto *Call = dyn_cast<CallBase>(I)) {
-        // If this is the function being called then we treat it like a load and
-        // ignore it.
-        if (Call->isCallee(&U))
-          continue;
-
-        unsigned DataOpNo = Call->getDataOperandNo(&U);
-        bool IsArgOperand = Call->isArgOperand(&U);
-
-        // Inalloca arguments are clobbered by the call.
-        if (IsArgOperand && Call->isInAllocaArgument(DataOpNo))
-          return false;
-
-        // If this is a readonly/readnone call site, then we know it is just a
-        // load (but one that potentially returns the value itself), so we can
-        // ignore it if we know that the value isn't captured.
-        if (Call->onlyReadsMemory() &&
-            (Call->use_empty() || Call->doesNotCapture(DataOpNo)))
-          continue;
-
-        // If this is being passed as a byval argument, the caller is making a
-        // copy, so it is only a read of the alloca.
-        if (IsArgOperand && Call->isByValArgument(DataOpNo))
-          continue;
-      }
-
-      // Lifetime intrinsics can be handled by the caller.
-      if (I->isLifetimeStartOrEnd()) {
-        assert(I->use_empty() && "Lifetime markers have no result to use!");
-        ToDelete.push_back(I);
-        continue;
-      }
-
-      // If this is isn't our memcpy/memmove, reject it as something we can't
-      // handle.
-      MemTransferInst *MI = dyn_cast<MemTransferInst>(I);
-      if (!MI)
-        return false;
-
-      // If the transfer is using the alloca as a source of the transfer, then
-      // ignore it since it is a load (unless the transfer is volatile).
-      if (U.getOperandNo() == 1) {
-        if (MI->isVolatile()) return false;
-        continue;
-      }
-
-      // If we already have seen a copy, reject the second one.
-      if (TheCopy) return false;
-
-      // If the pointer has been offset from the start of the alloca, we can't
-      // safely handle this.
-      if (IsOffset) return false;
-
-      // If the memintrinsic isn't using the alloca as the dest, reject it.
-      if (U.getOperandNo() != 0) return false;
-
-      // If the source of the memcpy/move is not a constant global, reject it.
-      if (!AA->pointsToConstantMemory(MI->getSource()))
-        return false;
-
-      // Otherwise, the transform is safe.  Remember the copy instruction.
-      TheCopy = MI;
     }
   }
   return true;
@@ -265,6 +400,7 @@ bool PointerReplacer::collectUsers(Instruction &I) {
         return false;
       Worklist.insert(Inst);
     } else if (Inst->isLifetimeStartOrEnd()) {
+      
       continue;
     } else {
       LLVM_DEBUG(dbgs() << "Cannot handle pointer user: " << *U << '\n');
